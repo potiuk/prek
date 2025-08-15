@@ -31,6 +31,7 @@ impl LanguageImpl for System {
         let run = async move |batch: Vec<String>| {
             let mut output = Cmd::new(&entry[0], "run system command")
                 .set_color_env()
+                .with_pty(true)
                 .args(&entry[1..])
                 .args(&hook.args)
                 .args(batch)

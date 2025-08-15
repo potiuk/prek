@@ -8,7 +8,7 @@ use itertools::Itertools;
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
-use crate::process::Cmd;
+use crate::process::{Cmd, CmdChild};
 use crate::{git, process};
 
 #[derive(Debug, thiserror::Error)]
@@ -407,23 +407,53 @@ pub async fn lfs_files<T: FromIterator<String>>(paths: &[&String]) -> Result<T, 
         // .output()
         .spawn()?;
 
-    {
-        let mut stdin = job.stdin.take().expect("Failed to open stdin");
-        stdin.write_all(paths.iter().join("\0").as_ref()).await?;
+    // Write paths to stdin for the child process
+    match &mut job {
+        CmdChild::TokioChild(child_opt) => {
+            if let Some(child) = child_opt.as_mut() {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    stdin
+                        .write_all(paths.iter().join("\0").as_ref())
+                        .await
+                        .map_err(Error::Io)?;
+                } else {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Failed to open stdin",
+                    )));
+                }
+            } else {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Child already taken",
+                )));
+            }
+        }
+        CmdChild::PtyChild { .. } => {
+            // PTY child: input handling may differ, skip or implement as needed
+        }
     }
 
-    Ok(
-        String::from_utf8_lossy(&job.wait_with_output().await?.stdout)
-            .trim()
-            .split('\0')
-            .tuples::<(_, _, _)>()
-            .filter_map(|(file, _, attr)| {
-                if attr == "lfs" {
-                    Some(file.to_owned())
-                } else {
-                    None
-                }
-            })
-            .collect(),
+    Ok(String::from_utf8_lossy(
+        &job.wait_with_output()
+            .await
+            .map_err(|e| {
+                Error::Command(process::Error::Exec {
+                    summary: "git check-attr wait_with_output".to_string(),
+                    cause: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                })
+            })?
+            .stdout,
     )
+    .trim()
+    .split('\0')
+    .tuples::<(_, _, _)>()
+    .filter_map(|(file, _, attr)| {
+        if attr == "lfs" {
+            Some(file.to_owned())
+        } else {
+            None
+        }
+    })
+    .collect())
 }

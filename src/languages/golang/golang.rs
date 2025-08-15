@@ -118,8 +118,10 @@ impl LanguageImpl for Golang {
 
         let entry = hook.entry.parsed()?;
         let run = async move |batch: Vec<String>| {
-            let mut output = Cmd::new(&entry[0], "go hook")
-                .set_color_env()
+            let mut base_cmd = Cmd::new(entry[0].clone(), "go hook");
+            base_cmd.set_color_env();
+            let cmd = base_cmd
+                .with_pty(true)
                 .args(&entry[1..])
                 .env("PATH", &new_path)
                 .env(EnvVars::GOTOOLCHAIN, "local")
@@ -128,13 +130,11 @@ impl LanguageImpl for Golang {
                 .env(EnvVars::GOPATH, &go_cache)
                 .args(&hook.args)
                 .args(batch)
-                .check(false)
-                .output()
-                .await?;
-
+                .check(false);
+            let mut output = cmd.output().await?;
             output.stdout.extend(output.stderr);
             let code = output.status.code().unwrap_or(1);
-            anyhow::Ok((code, output.stdout))
+            Ok((code, output.stdout))
         };
 
         let results = run_by_batch(hook, filenames, run).await?;

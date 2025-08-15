@@ -141,6 +141,7 @@ impl LanguageImpl for Python {
             // TODO: combine stdout and stderr
             let mut output = Cmd::new(&entry[0], "python hook")
                 .set_color_env()
+                .with_pty(true)
                 .args(&entry[1..])
                 .env("VIRTUAL_ENV", env_dir)
                 .env("PATH", &new_path)

@@ -152,6 +152,7 @@ impl LanguageImpl for Node {
 
             let mut output = cmd
                 .args(&entry[1..])
+                .with_pty(true)
                 .env("PATH", &new_path)
                 .env(EnvVars::NPM_CONFIG_PREFIX, env_dir)
                 .env_remove(EnvVars::NPM_CONFIG_USERCONFIG)

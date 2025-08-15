@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::hook::{Hook, InstallInfo, InstalledHook};
 use crate::languages::LanguageImpl;
 use crate::languages::python::{Uv, python_exec};
-use crate::process::Cmd;
+use crate::process::{Cmd, CmdChild};
 use crate::run::CONCURRENCY;
 use crate::store::{CacheBucket, Store, ToolBucket};
 
@@ -185,11 +185,22 @@ impl LanguageImpl for Pygrep {
             .check(false)
             .spawn()?;
 
-        let mut stdin = cmd.stdin.take().context("Failed to take stdin")?;
+        // Take ownership of stdin before spawning write task
+        let (mut cmd_child, stdin) = match cmd {
+            CmdChild::TokioChild(ref mut child_opt) => {
+                let child = child_opt.as_mut().expect("Child already taken");
+                let stdin = child.stdin.take().context("Failed to take stdin")?;
+                (CmdChild::TokioChild(child_opt.take()), stdin)
+            }
+            CmdChild::PtyChild { .. } => {
+                anyhow::bail!("Cannot write to stdin for PTY child in pygrep")
+            }
+        };
         // TODO: avoid this clone if possible.
         let filenames: Vec<_> = filenames.iter().map(ToString::to_string).collect();
 
         let write_task = tokio::spawn(async move {
+            let mut stdin = stdin;
             for filename in filenames {
                 stdin.write_all(format!("{filename}\n").as_bytes()).await?;
             }
@@ -197,7 +208,7 @@ impl LanguageImpl for Pygrep {
             anyhow::Ok(())
         });
 
-        let output = cmd
+        let output = cmd_child
             .wait_with_output()
             .await
             .context("Failed to wait for command output")?;

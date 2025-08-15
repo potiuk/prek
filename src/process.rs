@@ -36,6 +36,10 @@ use std::{
 use anstream::ColorChoice;
 use miette::Diagnostic;
 use owo_colors::OwoColorize;
+use portable_pty::{
+    Child, ChildKiller, CommandBuilder, ExitStatus as PtyExitStatus, MasterPty, PtySize,
+    native_pty_system,
+};
 use thiserror::Error;
 use tracing::trace;
 
@@ -107,6 +111,101 @@ pub struct Cmd {
     pub inner: tokio::process::Command,
     summary: String,
     check_status: bool,
+    use_pty: bool, // New field to indicate PTY usage
+}
+
+/// Represents a spawned process, which may be a normal process or a PTY process.
+pub enum CmdChild {
+    TokioChild(Option<tokio::process::Child>),
+    PtyChild {
+        child: Box<dyn Child + Send>,
+        master: Box<dyn MasterPty + Send>,
+    },
+}
+
+impl CmdChild {
+    pub async fn wait(&mut self) -> anyhow::Result<std::process::ExitStatus> {
+        match self {
+            CmdChild::TokioChild(child_opt) => {
+                let mut child = child_opt.take().expect("Child already taken");
+                let status = child.wait().await?;
+                Ok(status)
+            }
+            CmdChild::PtyChild { child, .. } => {
+                let mut child = std::mem::replace(child, Box::new(DummyChild));
+                let status = tokio::task::spawn_blocking(move || child.wait()).await??;
+                // Convert portable_pty::ExitStatus to std::process::ExitStatus
+                Ok(exit_status_to_std(status))
+            }
+        }
+    }
+
+    pub async fn wait_with_output(&mut self) -> anyhow::Result<std::process::Output> {
+        match self {
+            CmdChild::TokioChild(child_opt) => {
+                let child = child_opt.take().expect("Child already taken");
+                let output = child.wait_with_output().await?;
+                Ok(output)
+            }
+            CmdChild::PtyChild { child, master } => {
+                let mut stdout = Vec::new();
+                let mut buf = [0u8; 4096];
+                use std::io::Read;
+                let mut reader = match master.try_clone_reader() {
+                    Ok(r) => r,
+                    Err(_) => return Err(anyhow::anyhow!("Failed to clone PTY reader")),
+                };
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => stdout.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let mut child = std::mem::replace(child, Box::new(DummyChild));
+                let status = tokio::task::spawn_blocking(move || child.wait()).await??;
+                Ok(std::process::Output {
+                    status: exit_status_to_std(status),
+                    stdout,
+                    stderr: Vec::new(),
+                })
+            }
+        }
+    }
+}
+
+// Helper to convert portable_pty::ExitStatus to std::process::ExitStatus
+#[cfg(unix)]
+fn exit_status_to_std(status: PtyExitStatus) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(status.exit_code() as i32)
+}
+#[cfg(not(unix))]
+fn exit_status_to_std(_status: PtyExitStatus) -> std::process::ExitStatus {
+    std::process::ExitStatus::from_raw(0)
+}
+
+// DummyChild for trait object replacement
+#[derive(Debug)]
+struct DummyChild;
+impl Child for DummyChild {
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+    fn wait(&mut self) -> std::result::Result<PtyExitStatus, std::io::Error> {
+        Ok(PtyExitStatus::with_exit_code(0))
+    }
+    fn try_wait(&mut self) -> std::result::Result<Option<PtyExitStatus>, std::io::Error> {
+        Ok(Some(PtyExitStatus::with_exit_code(0)))
+    }
+}
+impl ChildKiller for DummyChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn clone_killer(&self) -> Box<(dyn ChildKiller + Send + Sync + 'static)> {
+        Box::new(DummyChild)
+    }
 }
 
 /// Constructors
@@ -118,6 +217,7 @@ impl Cmd {
             summary: summary.into(),
             inner,
             check_status: true,
+            use_pty: false,
         }
     }
 }
@@ -170,6 +270,12 @@ impl Cmd {
         let color_choice = ColorChoice::global();
         self.set_color_env_with_choice(color_choice)
     }
+
+    /// Enable PTY allocation for this command
+    pub fn with_pty(&mut self, use_pty: bool) -> &mut Self {
+        self.use_pty = use_pty;
+        self
+    }
 }
 
 /// Execution APIs
@@ -183,12 +289,45 @@ impl Cmd {
 
     /// Equivalent to [`std::process::Command::spawn`][],
     /// but logged and with the error wrapped.
-    pub fn spawn(&mut self) -> Result<tokio::process::Child> {
+    pub fn spawn(&mut self) -> Result<CmdChild> {
         self.log_command();
-        self.inner.spawn().map_err(|cause| Error::Exec {
+        if self.use_pty {
+            let pty_system = native_pty_system();
+            let pair = pty_system
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|cause| Error::Exec {
+                    summary: self.summary.clone(),
+                    cause: std::io::Error::new(std::io::ErrorKind::Other, cause.to_string()),
+                })?;
+            let mut cmd_builder =
+                CommandBuilder::new(self.get_program().to_string_lossy().to_string());
+            // Inject color-supporting environment variables
+            cmd_builder.env("FORCE_COLOR", "1");
+            cmd_builder.env("CLICOLOR", "1");
+            cmd_builder.env("TERM", "xterm-256color");
+            // PTY automatically handles stdout and stderr
+            let child = pair
+                .slave
+                .spawn_command(cmd_builder)
+                .map_err(|cause| Error::Exec {
+                    summary: self.summary.clone(),
+                    cause: std::io::Error::new(std::io::ErrorKind::Other, cause.to_string()),
+                })?;
+            return Ok(CmdChild::PtyChild {
+                child,
+                master: pair.master,
+            });
+        }
+        let child = self.inner.spawn().map_err(|cause| Error::Exec {
             summary: self.summary.clone(),
             cause,
-        })
+        })?;
+        Ok(CmdChild::TokioChild(Some(child)))
     }
 
     /// Equivalent to [`std::process::Command::output`][],

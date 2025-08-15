@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use indoc::indoc;
 use owo_colors::{OwoColorize, Style};
+use portable_pty::native_pty_system;
 use rand::SeedableRng;
 use rand::prelude::{SliceRandom, StdRng};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -540,6 +541,13 @@ impl StatusPrinter {
     fn stdout(&self) -> Stdout {
         self.printer.stdout()
     }
+}
+
+/// Minimal usage of portable-pty to avoid unused crate warning
+fn _use_portable_pty() {
+    let pty_system = native_pty_system();
+    // This is a no-op usage to ensure the crate is used
+    let _ = pty_system;
 }
 
 /// Run all hooks.

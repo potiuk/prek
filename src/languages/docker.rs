@@ -219,7 +219,8 @@ impl LanguageImpl for Docker {
 
         let run = async move |batch: Vec<String>| {
             // docker run [OPTIONS] IMAGE [COMMAND] [ARG...]
-            let mut cmd = Docker::docker_run_cmd().await?;
+            let mut base_cmd = Docker::docker_run_cmd().await?;
+            let cmd = base_cmd.with_pty(true);
             let cmd = cmd
                 .arg("--entrypoint")
                 .arg(&entry[0])

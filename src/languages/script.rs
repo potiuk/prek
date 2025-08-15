@@ -35,6 +35,7 @@ impl LanguageImpl for Script {
         let run = async move |batch: Vec<String>| {
             let mut command = Cmd::new(&cmd, "run script command")
                 .set_color_env()
+                .with_pty(true)
                 .args(&entry[1..])
                 .args(&hook.args)
                 .args(batch)
