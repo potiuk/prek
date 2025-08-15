@@ -38,6 +38,7 @@ impl Docker {
         };
 
         let mut cmd = Cmd::new("docker", "build docker image");
+        cmd.set_color_env();
 
         let cmd = cmd
             .arg("build")
@@ -99,6 +100,7 @@ impl Docker {
         trace!(?container_id, "Get container id");
 
         if let Ok(output) = Cmd::new("docker", "inspect container")
+            .set_color_env()
             .arg("inspect")
             .arg("--format")
             .arg("'{{json .Mounts}}'")
@@ -138,6 +140,7 @@ impl Docker {
 
     pub(crate) async fn docker_run_cmd() -> Result<Cmd> {
         let mut command = Cmd::new("docker", "run container");
+        command.set_color_env();
         command.arg("run").arg("--rm");
 
         match ColorChoice::global() {
